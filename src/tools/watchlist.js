@@ -8,6 +8,18 @@ export function registerWatchlistTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  server.tool('watchlist_list', 'List all TradingView watchlist names and which one is currently active', {}, async () => {
+    try { return jsonResult(await core.list()); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('watchlist_switch', 'Switch to a named TradingView watchlist (case-insensitive match)', {
+    name: z.string().describe('Watchlist name to switch to (e.g. "Jlaw list", "QTS"). Case-insensitive.'),
+  }, async ({ name }) => {
+    try { return jsonResult(await core.switchTo({ name })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('watchlist_add', 'Add a symbol to the TradingView watchlist', {
     symbol: z.string().describe('Symbol to add (e.g., AAPL, BTCUSD, ES1!, NYMEX:CL1!)'),
   }, async ({ symbol }) => {
