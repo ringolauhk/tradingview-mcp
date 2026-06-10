@@ -4,61 +4,130 @@
  */
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
 
+// Helper: collect all currently-rendered symbol rows from the container.
+// Returns an array of { symbol, last, change, change_percent }.
+const _COLLECT_JS = `
+(function() {
+  var container = document.querySelector('[class*="listContainer-"]');
+  if (!container) return { symbols: [], source: 'no_container' };
+  var results = [];
+  var seen = {};
+  var symbolEls = container.querySelectorAll('[data-symbol-full]');
+  for (var i = 0; i < symbolEls.length; i++) {
+    var sym = symbolEls[i].getAttribute('data-symbol-full');
+    if (!sym || seen[sym]) continue;
+    seen[sym] = true;
+    var row = symbolEls[i].closest('[class*="row"]') || symbolEls[i].closest('[class*="wrap-"]') || symbolEls[i].parentElement;
+    var cells = row ? row.querySelectorAll('[class*="cell"], [class*="column"]') : [];
+    var nums = [];
+    for (var j = 0; j < cells.length; j++) {
+      var t = cells[j].textContent.trim();
+      if (t && /^[\\-+]?[\\d,]+\\.?\\d*%?$/.test(t.replace(/[\\s,]/g, ''))) nums.push(t);
+    }
+    results.push({ symbol: sym, last: nums[0] || null, change: nums[1] || null, change_percent: nums[2] || null });
+  }
+  return { symbols: results, scrollTop: container.scrollTop, scrollHeight: container.scrollHeight, clientHeight: container.clientHeight };
+})()
+`;
+
 export async function get() {
-  // Try internal API first — reads from the active watchlist widget
-  const symbols = await evaluate(`
+  // Detect the virtualised scroll container (listContainer-*).
+  // If absent, fall back to a single-pass scan of the right panel.
+  const probe = await evaluate(`
     (function() {
-      // Method 1: Try the watchlist widget's internal data
-      try {
-        var rightArea = document.querySelector('[class*="layout__area--right"]');
-        if (!rightArea || rightArea.offsetWidth < 50) return { symbols: [], source: 'panel_closed' };
-      } catch(e) {}
-
-      // Method 2: Read data-symbol-full attributes from watchlist rows
-      var results = [];
-      var seen = {};
-      var container = document.querySelector('[class*="layout__area--right"]');
-      if (!container) return { symbols: [], source: 'no_container' };
-
-      // Find all elements with symbol data attributes
-      var symbolEls = container.querySelectorAll('[data-symbol-full]');
-      for (var i = 0; i < symbolEls.length; i++) {
-        var sym = symbolEls[i].getAttribute('data-symbol-full');
-        if (!sym || seen[sym]) continue;
-        seen[sym] = true;
-
-        // Find the row and extract price data
-        var row = symbolEls[i].closest('[class*="row"]') || symbolEls[i].parentElement;
-        var cells = row ? row.querySelectorAll('[class*="cell"], [class*="column"]') : [];
-        var nums = [];
-        for (var j = 0; j < cells.length; j++) {
-          var t = cells[j].textContent.trim();
-          if (t && /^[\\-+]?[\\d,]+\\.?\\d*%?$/.test(t.replace(/[\\s,]/g, ''))) nums.push(t);
-        }
-        results.push({ symbol: sym, last: nums[0] || null, change: nums[1] || null, change_percent: nums[2] || null });
-      }
-
-      if (results.length > 0) return { symbols: results, source: 'data_attributes' };
-
-      // Method 3: Scan for ticker-like text in the right panel
-      var items = container.querySelectorAll('[class*="symbolName"], [class*="tickerName"], [class*="symbol-"]');
-      for (var k = 0; k < items.length; k++) {
-        var text = items[k].textContent.trim();
-        if (text && /^[A-Z][A-Z0-9.:!]{0,20}$/.test(text) && !seen[text]) {
-          seen[text] = true;
-          results.push({ symbol: text, last: null, change: null, change_percent: null });
-        }
-      }
-
-      return { symbols: results, source: results.length > 0 ? 'text_scan' : 'empty' };
+      var c = document.querySelector('[class*="listContainer-"]');
+      if (!c) return null;
+      return { scrollTop: c.scrollTop, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight };
     })()
   `);
 
+  if (!probe) {
+    // No virtualised container — panel may be closed or layout changed.
+    // Fall back to right-panel scan (original behaviour).
+    const fallback = await evaluate(`
+      (function() {
+        var container = document.querySelector('[class*="layout__area--right"]');
+        if (!container || container.offsetWidth < 50) return { symbols: [], source: 'panel_closed' };
+        var results = [];
+        var seen = {};
+        var items = container.querySelectorAll('[class*="symbolName"], [class*="tickerName"], [class*="symbol-"]');
+        for (var k = 0; k < items.length; k++) {
+          var text = items[k].textContent.trim();
+          if (text && /^[A-Z][A-Z0-9.:!]{0,20}$/.test(text) && !seen[text]) {
+            seen[text] = true;
+            results.push({ symbol: text, last: null, change: null, change_percent: null });
+          }
+        }
+        return { symbols: results, source: results.length > 0 ? 'text_scan' : 'empty' };
+      })()
+    `);
+    return {
+      success: true,
+      count: fallback?.symbols?.length || 0,
+      source: fallback?.source || 'unknown',
+      symbols: fallback?.symbols || [],
+    };
+  }
+
+  // TradingView virtualises rows — only the visible slice is in the DOM.
+  // Scroll from top to bottom in clientHeight-sized steps, collecting
+  // data-symbol-full attributes at every position.
+  const { scrollTop: originalScrollTop, scrollHeight, clientHeight } = probe;
+  const STEP = Math.max(clientHeight - 40, 150);  // overlap a little to avoid missing rows at boundaries
+  const MAX_STEPS = Math.ceil(scrollHeight / STEP) + 5;  // safety ceiling
+  const MAX_NO_NEW = 3;  // stop if this many consecutive steps add nothing new
+
+  const seen = {};
+  const results = [];
+  let noNewStreak = 0;
+
+  // Scroll to top before collecting.
+  await evaluate(`(function(){ var c=document.querySelector('[class*="listContainer-"]'); if(c) c.scrollTop=0; })()`);
+  await new Promise(r => setTimeout(r, 250));
+
+  for (let step = 0; step <= MAX_STEPS; step++) {
+    const batch = await evaluate(_COLLECT_JS);
+    const batchSymbols = batch?.symbols || [];
+
+    let newThisStep = 0;
+    for (const item of batchSymbols) {
+      if (item.symbol && !seen[item.symbol]) {
+        seen[item.symbol] = true;
+        results.push(item);
+        newThisStep++;
+      }
+    }
+
+    if (newThisStep === 0) {
+      noNewStreak++;
+      if (noNewStreak >= MAX_NO_NEW) break;
+    } else {
+      noNewStreak = 0;
+    }
+
+    // Check whether we have reached the bottom of the container.
+    const atBottom = await evaluate(`
+      (function(){
+        var c=document.querySelector('[class*="listContainer-"]');
+        if(!c) return true;
+        return c.scrollTop + c.clientHeight >= c.scrollHeight - 2;
+      })()
+    `);
+    if (atBottom) break;
+
+    // Scroll down one step and wait for virtualised rows to render.
+    await evaluate(`(function(s){ var c=document.querySelector('[class*="listContainer-"]'); if(c) c.scrollTop+=s; })(${STEP})`);
+    await new Promise(r => setTimeout(r, 250));
+  }
+
+  // Restore original scroll position.
+  await evaluate(`(function(p){ var c=document.querySelector('[class*="listContainer-"]'); if(c) c.scrollTop=p; })(${originalScrollTop})`);
+
   return {
     success: true,
-    count: symbols?.symbols?.length || 0,
-    source: symbols?.source || 'unknown',
-    symbols: symbols?.symbols || [],
+    count: results.length,
+    source: 'data_attributes_scrolled',
+    symbols: results,
   };
 }
 
